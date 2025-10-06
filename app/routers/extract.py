@@ -1,328 +1,469 @@
-from fastapi import APIRouter, UploadFile, File, Form
-from app.db import get_conn
-from app.core.errors import error_response
-from app.services.azure_di import analyze
-from app.services.text import flatten_text
-from app.services.embedding import embed_text
-import logging, json, re
+# app/routers/extract.py
+from __future__ import annotations
+
+from typing import Optional, Callable, Dict, Any, List
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Request, Query
+from azure.core.exceptions import HttpResponseError, ResourceNotFoundError
 from datetime import datetime, date
-from decimal import Decimal, InvalidOperation
+import re, json
 
-log = logging.getLogger("erp_ai.extract")
-router = APIRouter()
+# per-type extractors
+from app.di_extractors import invoice, id_document, bank_statement, receipt, generic_document
 
-TBL = {
-    "passport":       "erp_ai.passport_docs",
-    "visa":           "erp_ai.visa_docs",
-    "work_permit":    "erp_ai.work_permit_docs",
-    "resume":         "erp_ai.resume_docs",
-    "bank_statement": "erp_ai.bank_statement_docs",
-    "invoice":        "erp_ai.invoice_docs",
-    "injury_report":  "erp_ai.injury_report_docs",
+# asyncpg pool helpers
+from app.db import db_conn
+
+router = APIRouter(prefix="/extract", tags=["extract"])
+
+# Map doc_type -> (analyze_url, analyze_bytes, to_dict, model_id)
+EXTRACTORS: Dict[str, Dict[str, Callable[..., Any]]] = {
+    "invoice":        {"analyze_url": invoice.analyze_invoice_url,          "analyze_bytes": invoice.analyze_invoice_bytes,          "to_dict": invoice.invoice_to_dict,          "model_id": lambda: invoice.MODEL_ID},
+    "passport":       {"analyze_url": id_document.analyze_id_url,           "analyze_bytes": id_document.analyze_id_bytes,           "to_dict": id_document.id_to_dict,           "model_id": lambda: id_document.MODEL_ID},
+    "visa":           {"analyze_url": id_document.analyze_id_url,           "analyze_bytes": id_document.analyze_id_bytes,           "to_dict": id_document.id_to_dict,           "model_id": lambda: id_document.MODEL_ID},
+    "work_permit":    {"analyze_url": id_document.analyze_id_url,           "analyze_bytes": id_document.analyze_id_bytes,           "to_dict": id_document.id_to_dict,           "model_id": lambda: id_document.MODEL_ID},
+    "bank_statement": {"analyze_url": bank_statement.analyze_bank_stmt_url, "analyze_bytes": bank_statement.analyze_bank_stmt_bytes,  "to_dict": bank_statement.bank_stmt_to_dict,  "model_id": lambda: bank_statement.MODEL_ID},
+    "receipt":        {"analyze_url": receipt.analyze_receipt_url,          "analyze_bytes": receipt.analyze_receipt_bytes,          "to_dict": receipt.receipt_to_dict,          "model_id": lambda: receipt.MODEL_ID},
+    "resume":         {"analyze_url": generic_document.analyze_generic_url, "analyze_bytes": generic_document.analyze_generic_bytes, "to_dict": generic_document.generic_to_dict, "model_id": lambda: generic_document.MODEL_ID},
+    "injury_report":  {"analyze_url": generic_document.analyze_generic_url, "analyze_bytes": generic_document.analyze_generic_bytes, "to_dict": generic_document.generic_to_dict, "model_id": lambda: generic_document.MODEL_ID},
 }
 
-# ---------- helpers ----------
-def _doc_fields(di_json: dict):
-    try:
-        docs = (di_json.get("analyzeResult", {}) or {}).get("documents", []) or []
-        return (docs[0].get("fields", {}) if docs else {}) or {}
-    except Exception:
-        return {}
+VALID_TYPES = list(EXTRACTORS.keys())
 
-def _val(field_obj):
-    """Return best-typed value from a DI field object."""
-    if not isinstance(field_obj, dict):
-        return None
-    # try typed first
-    for k in ("valueString", "valueDate", "valueTime", "valuePhoneNumber", "valueNumber"):
-        if k in field_obj and field_obj[k] is not None:
-            return field_obj[k]
-    # currency
-    if "valueCurrency" in field_obj and isinstance(field_obj["valueCurrency"], dict):
-        vc = field_obj["valueCurrency"]
-        # return (amount, currencyCode)
-        amt = vc.get("amount")
-        ccy = vc.get("currencyCode") or vc.get("currencySymbol")
-        if amt is not None:
-            return {"amount": amt, "currency": ccy}
-    # fallback to content
-    return field_obj.get("content")
+def _ensure_supported(doc_type: Optional[str]):
+    if not doc_type:
+        raise HTTPException(status_code=400, detail=f"'doc_type' is required. Valid: {VALID_TYPES}")
+    if doc_type not in EXTRACTORS:
+        raise HTTPException(status_code=400, detail=f"Unsupported doc_type '{doc_type}'. Valid: {VALID_TYPES}")
 
-def _get(di_json: dict, name: str):
-    return _val(_doc_fields(di_json).get(name))
+# ---------- parsing / normalization helpers ----------
+def _to_snake(s: str) -> str:
+    s = re.sub("(.)([A-Z][a-z]+)", r"\1_\2", s)
+    s = re.sub("([a-z0-9])([A-Z])", r"\1_\2", s)
+    return s.replace("__", "_").lower()
 
-def _to_vector_literal(vec) -> str | None:
-    try:
-        if not vec or not isinstance(vec, (list, tuple)):
-            return None
-        return "[" + ",".join(str(float(x)) for x in vec) + "]"
-    except Exception:
-        return None
+def _fval(fields: Dict[str, Any], key: str):
+    obj = fields.get(key) or {}
+    return obj.get("value")
 
 _DATE_PATTERNS = [
-    "%Y-%m-%d", "%d %b %Y", "%d %B %Y", "%b %d %Y", "%B %d %Y",
-    "%d/%m/%Y", "%m/%d/%Y", "%d-%m-%Y", "%m-%d-%Y",
+    (r"^\d{4}-\d{2}-\d{2}$", "%Y-%m-%d"),
+    (r"^\d{2}/\d{2}/\d{4}$", "%d/%m/%Y"),
+    (r"^\d{2}-\d{2}-\d{4}$", "%d-%m-%Y"),
+    (r"^\d{4}/\d{2}/\d{2}$", "%Y/%m/%d"),
+    (r"^\d{2}\s+[A-Z]{3}\s+\d{4}$", "%d %b %Y"),   # 02 NOV 1975
+    (r"^\d{2}\s+[A-Za-z]+\s+\d{4}$", "%d %B %Y"),  # 02 November 1975
 ]
 
-def _parse_date(val) -> date | None:
-    if val is None:
+def _to_date(v: Any) -> Optional[date]:
+    if v is None:
         return None
-    if isinstance(val, date):
-        return val
-    s = str(val).strip()
-    if not s: return None
-    s = re.sub(r"(\d{1,2})(st|nd|rd|th)\b", r"\1", s, flags=re.IGNORECASE)
-    for fmt in _DATE_PATTERNS:
+    if isinstance(v, date) and not isinstance(v, datetime):
+        return v
+    if isinstance(v, datetime):
+        return v.date()
+    s = str(v).strip()
+    for rx, fmt in _DATE_PATTERNS:
+        if re.match(rx, s):
+            try:
+                return datetime.strptime(s, fmt).date()
+            except Exception:
+                pass
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).date()
+    except Exception:
+        return None
+
+def _to_num(v: Any) -> Optional[float]:
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    s = str(v).strip().replace(",", "")
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+def _looks_like_address_dict(d: Dict[str, Any]) -> bool:
+    addr_keys = {"houseNumber","poBox","road","street","streetAddress","unit","city","town","municipality","state","province","region","postalCode","zip","countryRegion","country"}
+    return any(k in d for k in addr_keys)
+
+def _flatten_address(d: Dict[str, Any]) -> str:
+    parts = []
+    for key in ["houseNumber","unit","poBox","street","road","streetAddress","city","town","municipality","state","province","region","postalCode","zip","countryRegion","country"]:
+        val = d.get(key)
+        if val:
+            parts.append(str(val))
+    if not parts and "content" in d:
+        return str(d["content"])
+    return ", ".join(parts) if parts else json.dumps(d, ensure_ascii=False)
+
+def _to_text(v: Any) -> Optional[str]:
+    if v is None:
+        return None
+    if isinstance(v, (list, tuple)):
         try:
-            return datetime.strptime(s, fmt).date()
-        except ValueError:
-            pass
-    m = re.search(r"\b(\d{4})-(\d{2})-(\d{2})\b", s)
-    if m:
-        try: return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
-        except Exception: pass
-    return None
+            flat = []
+            for x in v:
+                if isinstance(x, (dict, list, tuple)):
+                    return json.dumps(v, ensure_ascii=False)
+                flat.append("" if x is None else str(x))
+            return ", ".join(flat)
+        except Exception:
+            return json.dumps(v, ensure_ascii=False)
+    if isinstance(v, dict):
+        if _looks_like_address_dict(v):
+            return _flatten_address(v)
+        if "content" in v and isinstance(v["content"], (str, int, float)):
+            return str(v["content"])
+        return json.dumps(v, ensure_ascii=False)
+    return str(v)
 
-_CURRENCY_RE = re.compile(r"[^\d\.\-]")
-def _parse_decimal(val) -> Decimal | None:
-    if val is None: return None
-    if isinstance(val, (int, float, Decimal)):
-        try: return Decimal(val)
-        except Exception: return None
-    s = str(val).strip()
-    if not s: return None
-    s = s.replace(",", "")
-    s = _CURRENCY_RE.sub("", s)
-    try: return Decimal(s)
-    except (InvalidOperation, ValueError): return None
-
-def _json_default(o):
-    if isinstance(o, Decimal):   return float(o)
-    if isinstance(o, (datetime, date)): return o.isoformat()
-    return str(o)
-
-def _json_dump(val) -> str | None:
-    if val is None: return None
-    return json.dumps(val, default=_json_default)
-
-JSON_COLS = {
-    "extracted_json",
-    "entities_json",
-    "skills",
-    "education",
-    "experience",
-    "certifications",
-    "transactions_json",
-    "line_items_json",
+# ---------- table typing rules ----------
+TABLE_DATE_COLS = {
+    "invoice_docs": {"invoice_date","due_date","service_start_date","service_end_date"},
+    "bank_statement_docs": {"statement_start_date","statement_end_date"},
+    "passport_docs": {"date_of_birth","date_of_issue","date_of_expiration"},
+    "visa_docs": {"date_of_birth","date_of_issue","date_of_expiration"},
+    "work_permit_docs": {"date_of_birth","date_of_issue","date_of_expiration"},
+}
+TABLE_NUM_COLS = {
+    "invoice_docs": {"invoice_total","subtotal","total_tax","previous_unpaid_balance","amount_due"},
+}
+# Include key_value_pairs and tables for generic docs
+TABLE_JSON_COLS = {
+    "invoice_docs": {"fields","items"},
+    "bank_statement_docs": {"fields","accounts"},
+    "passport_docs": {"fields"},
+    "visa_docs": {"fields"},
+    "work_permit_docs": {"fields"},
+    "resume_docs": {"fields","key_value_pairs","tables"},
+    "injury_report_docs_docs": {"fields","key_value_pairs","tables"},
 }
 
-# ---------- endpoint ----------
-@router.post("/extract")
-async def extract(
-    doc_type: str = Form(...),
-    id: str = Form(...),
-    file: UploadFile = File(...),
+# Known scalar text columns per table
+TEXT_COLS_BY_TABLE = {
+    "invoice_docs": {
+        "vendor_name","vendor_address","vendor_address_recipient",
+        "customer_name","customer_id","customer_address","customer_address_recipient",
+        "invoice_id","purchase_order",
+        "billing_address","billing_address_recipient",
+        "shipping_address","shipping_address_recipient",
+        "service_address","service_address_recipient",
+        "remittance_address","remittance_address_recipient",
+    },
+    "bank_statement_docs": {"account_holder_name","account_holder_address","bank_name","bank_address"},
+    "passport_docs": {
+        "document_type","country_region","region","first_name","last_name","full_name","document_number",
+        "sex","nationality","address_text","machine_readable_zone","issuing_country","issuer","place_of_birth",
+        "place_of_issue","personal_number",
+    },
+    "visa_docs": {
+        "document_type","country_region","region","first_name","last_name","full_name","document_number",
+        "sex","nationality","address_text","machine_readable_zone","visa_number","visa_type","entries",
+        "duration_of_stay","issuing_country","issuer",
+    },
+    "work_permit_docs": {
+        "document_type","country_region","region","first_name","last_name","full_name","document_number",
+        "sex","nationality","address_text","machine_readable_zone","permit_number","permit_type","employer",
+        "occupation","issuing_country","issuer",
+    },
+    "resume_docs": {"doc_inferred_type"},
+    "injury_report_docs_docs": {"doc_inferred_type"},
+}
+
+PROVENANCE_COLS = ("model_id","source_filename","source_url","content_type")
+
+def _apply_type(table: str, col: str, value: Any):
+    if col in TABLE_DATE_COLS.get(table, set()):
+        return _to_date(value)
+    if col in TABLE_NUM_COLS.get(table, set()):
+        return _to_num(value)
+    return _to_text(value)
+
+def _collect_dynamic_columns_from_fields(table: str, fields: Dict[str, Any]) -> Dict[str, Any]:
+    allowed = set(TEXT_COLS_BY_TABLE.get(table, set()))
+    allowed |= TABLE_DATE_COLS.get(table, set())
+    allowed |= TABLE_NUM_COLS.get(table, set())
+
+    out: Dict[str, Any] = {}
+    for k, obj in (fields or {}).items():
+        val = (obj or {}).get("value")
+        snk = _to_snake(k)
+        if snk in allowed:
+            out[snk] = val
+
+    # derive full_name for ID docs if not returned explicitly
+    if table in ("passport_docs","visa_docs","work_permit_docs") and "full_name" not in out:
+        first = (fields.get("FirstName") or {}).get("value")
+        last  = (fields.get("LastName")  or {}).get("value")
+        if first or last:
+            out["full_name"] = f"{first or ''} {last or ''}".strip() or None
+    return out
+
+async def _dynamic_insert(
+    table: str,
+    shaped: Dict[str, Any],
+    *,
+    model_id: str,
+    source_filename: Optional[str],
+    source_url: Optional[str],
+    content_type: Optional[str],
+    extra_fixed: Dict[str, Any] | None = None,
+    extra_json: Dict[str, Any] | None = None,
+) -> str:
+    cols: list[str] = list(PROVENANCE_COLS)
+    params: list[Any] = [model_id, source_filename, source_url, content_type]
+
+    # extras (fixed scalars e.g. doc_inferred_type)
+    if extra_fixed:
+        for k, v in extra_fixed.items():
+            cols.append(k)
+            params.append(_apply_type(table, k, v))
+
+    # dynamic from fields
+    dyn = _collect_dynamic_columns_from_fields(table, shaped.get("fields", {}))
+    for k, v in dyn.items():
+        cols.append(k)
+        params.append(_apply_type(table, k, v))
+
+    # json payloads
+    json_cols = TABLE_JSON_COLS.get(table, set())
+    for k in sorted(json_cols):
+        cols.append(k)
+        payload = shaped.get(k, None)
+        if extra_json and k in extra_json:
+            payload = extra_json[k]
+        if payload is None:
+            payload = {} if k == "fields" else []
+        params.append(json.dumps(payload, ensure_ascii=False))
+
+    placeholders = ",".join(f"${i}" for i in range(1, len(params)+1))
+    q = f"INSERT INTO erp_ai.{table} ({','.join(cols)}) VALUES ({placeholders}) RETURNING id;"
+
+    async with db_conn() as conn:
+        row_id = await conn.fetchval(q, *params)
+    return str(row_id)
+
+# ---------- Generic KVP fallback (no schema) ----------
+# Extract multiple "Label: Value" segments from a single line.
+# Example: "Project No.: 1023  Company Employee: Yes  Subcontractor Employee: No"
+_SEGMENT_RE = re.compile(
+    r"([A-Za-z0-9/().'’\-&, ]+?)\s*:\s*([^:]+?)(?=(?:\s+[A-Za-z].{0,30}?:|$))"
+)
+
+def _clean_label(lbl: str) -> str:
+    s = (lbl or "").strip()
+    s = re.sub(r"^\d+\.\s*", "", s)  # strip leading "5. "
+    s = re.sub(r"\s+\.", ".", s)     # "No .:" -> "No.:"
+    s = re.sub(r"\s+", " ", s)       # collapse whitespace
+    return s
+
+def _derive_kv_pairs_from_result(result_obj: Any) -> List[Dict[str, Any]]:
+    pairs: List[Dict[str, Any]] = []
+    pages = getattr(result_obj, "pages", []) or []
+    for p in pages:
+        for ln in getattr(p, "lines", []) or []:
+            text = getattr(ln, "content", "") or ""
+            if not text or ":" not in text:
+                continue
+            for m in _SEGMENT_RE.finditer(text):
+                raw_label = m.group(1)
+                value = m.group(2)
+                key = _clean_label(raw_label)
+                pairs.append({
+                    "key": key,
+                    "value": (value or "").strip() or None,
+                    "key_confidence": None,
+                    "value_confidence": None,
+                })
+    # Deduplicate identical (key,value) while preserving order
+    seen = set()
+    deduped: List[Dict[str, Any]] = []
+    for kv in pairs:
+        sig = (kv["key"], kv["value"])
+        if sig in seen:
+            continue
+        seen.add(sig)
+        deduped.append(kv)
+    return deduped
+
+# ---------- ROUTE ----------
+@router.post("")
+async def extract_document(
+    request: Request,
+    doc_type_q: Optional[str] = Query(default=None, description=f"One of: {VALID_TYPES}"),
+    doc_type_f: Optional[str] = Form(default=None, description=f"One of: {VALID_TYPES}"),
+    file: Optional[UploadFile] = File(default=None),
+    url_form: Optional[str] = Form(default=None),
+    url_query: Optional[str] = Query(default=None),
 ):
-    if doc_type not in TBL:
-        return error_response(f"Unsupported doc_type '{doc_type}'", 400, "EBADTYPE")
+    """
+    Provide **doc_type** and either **file** or **url**.
+    - Query: /extract?doc_type=invoice&url=...
+    - Form:  doc_type=invoice, file=@...
+    - JSON:  {"doc_type":"invoice","url":"https://..."}
+    """
+    # doc_type from form > query > JSON
+    doc_type: Optional[str] = doc_type_f or doc_type_q
+    url: Optional[str] = url_form or url_query
+    if not doc_type or (not url and not file):
+        if request.headers.get("content-type", "").startswith("application/json"):
+            try:
+                body = await request.json()
+                doc_type = doc_type or body.get("doc_type")
+                url = url or body.get("url")
+            except Exception:
+                pass
+
+    _ensure_supported(doc_type)
+
+    if not file and not url:
+        raise HTTPException(status_code=400, detail="Provide either 'file' or 'url'.")
+    if file and url:
+        raise HTTPException(status_code=400, detail="Provide only one of 'file' or 'url', not both.")
+
+    ex = EXTRACTORS[doc_type]  # type: ignore
+    to_dict = ex["to_dict"]
+    model_id = ex["model_id"]()
+
+    data: Optional[bytes] = None
+    content_type: Optional[str] = None
+    source_filename: Optional[str] = None
+    source_url: Optional[str] = None
+
+    if file:
+        source_filename = file.filename
+        data = await file.read()
+        if not data:
+            raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+        content_type = getattr(file, "content_type", None)
 
     try:
-        content = await file.read()
-        if not content:
-            return error_response("Empty file", 400, "EEMPTY")
-
-        di = await analyze(doc_type, content, file.content_type or "application/pdf")
-        text = flatten_text(di)
-        emb_literal = _to_vector_literal(await embed_text(text or " "))
-
-        updates: dict[str, object] = {
-            "status":         "extracted",
-            "di_model":       "prebuilt-document",
-            "extracted_json": di,
-            "text_full":      text,
-            "embedding":      emb_literal,
-        }
-
-        if doc_type == "invoice":
-            # pull typed fields
-            inv_id      = _get(di, "InvoiceId")
-            inv_date    = _parse_date(_get(di, "InvoiceDate"))
-            due_date    = _parse_date(_get(di, "DueDate"))
-            po_number   = _get(di, "PurchaseOrder")
-            vendor_name = _get(di, "VendorName")
-            vendor_tax  = _get(di, "VendorTaxId")
-            cust_name   = _get(di, "CustomerName")
-            cust_addr   = _get(di, "CustomerAddress")  # string content
-            bill_addr   = _get(di, "BillingAddress") or _get(di, "CustomerAddress")
-            ship_addr   = _get(di, "ShippingAddress")
-
-            subtotal_v  = _get(di, "SubTotal") or _get(di, "Subtotal")
-            total_tax_v = _get(di, "TotalTax") or _get(di, "Tax")
-            total_v     = _get(di, "Total") or _get(di, "AmountDue")
-
-            # amounts may come as numbers or {amount,currency}
-            def pick_amount(x):
-                if isinstance(x, dict) and "amount" in x:
-                    return _parse_decimal(x.get("amount"))
-                return _parse_decimal(x)
-
-            def pick_currency(*vals):
-                for v in vals:
-                    if isinstance(v, dict) and v.get("currency"):
-                        return v.get("currency")
-                # heuristic fallback from OCR text (GBP, USD, EUR)
-                m = re.search(r"\b(USD|EUR|GBP|AED|INR|CAD|AUD)\b", text or "", re.I)
-                return (m.group(1).upper() if m else None)
-
-            subtotal = pick_amount(subtotal_v)
-            total_tax = pick_amount(total_tax_v)
-            total = pick_amount(total_v)
-            currency = pick_currency(subtotal_v, total_v, total_tax_v)
-
-            # items
-            lines = None
+        # Run the selected model
+        if data is not None:
             try:
-                docs = (di.get("analyzeResult", {}) or {}).get("documents", []) or []
-                if docs:
-                    f = (docs[0].get("fields", {}) or {})
-                    items = f.get("Items", {})
-                    if isinstance(items, dict) and isinstance(items.get("valueArray"), list):
-                        lines = []
-                        for idx, it in enumerate(items["valueArray"], start=1):
-                            vo = it.get("valueObject", {}) or {}
-                            def obj(n): return _val(vo.get(n))
-                            qty  = pick_amount(obj("Quantity"))
-                            up   = pick_amount(obj("UnitPrice"))
-                            amt  = pick_amount(obj("Amount"))
-                            lines.append({
-                                "line_no":     idx,
-                                "description": obj("Description"),
-                                "quantity":    qty,
-                                "unit":        obj("Unit"),
-                                "unit_price":  up,
-                                "amount":      amt,
-                            })
-            except Exception as e:
-                log.warning("Invoice line parse warn: %s", e)
+                result = ex["analyze_bytes"](data, content_type)  # type: ignore
+            except TypeError:
+                result = ex["analyze_bytes"](data)  # type: ignore
+        else:
+            if not url or not url.strip():
+                raise HTTPException(status_code=400, detail="URL is empty.")
+            source_url = url.strip()
+            result = ex["analyze_url"](source_url)  # type: ignore
 
-            updates.update({
-                "di_model":              "prebuilt-invoice",
-                "invoice_number":        inv_id,
-                "invoice_date":          inv_date,
-                "due_date":              due_date,
-                "vendor_name":           vendor_name,
-                "vendor_tax_id":         vendor_tax,
-                "customer_name":         cust_name,
-                "billing_address":       bill_addr,
-                "shipping_address":      ship_addr,
-                "purchase_order_number": po_number,
-                "currency":              currency,
-                "subtotal_amount":       subtotal,
-                "tax_amount":            total_tax,
-                "total_amount":          total,
-                "line_items_json":       lines,
-            })
+        shaped = to_dict(result, doc_kind=doc_type) if doc_type in ("passport","visa","work_permit") else to_dict(result)
 
-        elif doc_type == "passport":
-            from_fields = {
-                "passport_number": _get(di, "DocumentNumber"),
-                "first_name":      _get(di, "FirstName"),
-                "last_name":       _get(di, "LastName"),
-                "expiry_date":     _parse_date(_get(di, "DateOfExpiration")),
-                "country":         _get(di, "CountryRegion"),
-            }
-            updates.update({"di_model": "prebuilt-idDocument", **from_fields})
+        # ---------- Generic KVP fallback for layout-only docs ----------
+        # If prebuilt-layout gave no kv_pairs (common for templates / plain lines),
+        # derive generic key:value pairs directly from the recognized lines.
+        if doc_type in ("resume", "injury_report"):
+            if not shaped.get("key_value_pairs"):
+                kv_fallback = _derive_kv_pairs_from_result(result)
+                if kv_fallback:
+                    shaped.setdefault("key_value_pairs", kv_fallback)
+            # Ensure defaults exist so downstream JSON columns are never null
+            shaped.setdefault("fields", {})
+            shaped.setdefault("tables", [])
 
-        elif doc_type == "visa":
-            from_fields = {
-                "visa_number":     _get(di, "VisaNumber") or _get(di, "DocumentNumber"),
-                "category":        _get(di, "Category"),
-                "issued_date":     _parse_date(_get(di, "DateOfIssue")),
-                "expiry_date":     _parse_date(_get(di, "DateOfExpiration")),
-                "issuing_country": _get(di, "CountryRegion"),
-                "holder_name":     ( (_get(di,"FirstName") or "") + " " + (_get(di,"LastName") or "") ).strip(),
-            }
-            updates.update({"di_model": "prebuilt-idDocument", **from_fields})
-
-        elif doc_type == "work_permit":
-            from_fields = {
-                "permit_number": _get(di, "DocumentNumber"),
-                "holder_name":   ( (_get(di,"FirstName") or "") + " " + (_get(di,"LastName") or "") ).strip(),
-                "employer_name": _get(di, "Employer") or _get(di, "Organization"),
-                "job_title":     _get(di, "Profession") or _get(di, "JobTitle"),
-                "issued_date":   _parse_date(_get(di, "DateOfIssue")),
-                "expiry_date":   _parse_date(_get(di, "DateOfExpiration")),
-            }
-            updates.update({"di_model": "prebuilt-idDocument", **from_fields})
-
-        elif doc_type == "resume":
-            updates.update({
-                "di_model":       "prebuilt-document",
-                "candidate_name": _get(di, "PersonName"),
-                "email":          _get(di, "Email") or _get(di, "EmailAddress"),
-                "phone":          _get(di, "PhoneNumber"),
-            })
-
+        # ---- Persist to your tables (asyncpg) ----
+        if doc_type == "invoice":
+            row_id = await _dynamic_insert(
+                table="invoice_docs",
+                shaped=shaped,
+                model_id=model_id,
+                source_filename=source_filename,
+                source_url=source_url,
+                content_type=content_type,
+                extra_json={"fields": shaped.get("fields", {}), "items": shaped.get("items", [])},
+            )
         elif doc_type == "bank_statement":
-            updates.update({"di_model": "prebuilt-bankStatement"})
-
+            row_id = await _dynamic_insert(
+                table="bank_statement_docs",
+                shaped=shaped,
+                model_id=model_id,
+                source_filename=source_filename,
+                source_url=source_url,
+                content_type=content_type,
+                extra_json={"fields": shaped.get("fields", {}), "accounts": shaped.get("accounts", [])},
+            )
+        elif doc_type == "passport":
+            row_id = await _dynamic_insert(
+                table="passport_docs",
+                shaped=shaped,
+                model_id=model_id,
+                source_filename=source_filename,
+                source_url=source_url,
+                content_type=content_type,
+                extra_json={"fields": shaped.get("fields", {})},
+            )
+        elif doc_type == "visa":
+            row_id = await _dynamic_insert(
+                table="visa_docs",
+                shaped=shaped,
+                model_id=model_id,
+                source_filename=source_filename,
+                source_url=source_url,
+                content_type=content_type,
+                extra_json={"fields": shaped.get("fields", {})},
+            )
+        elif doc_type == "work_permit":
+            row_id = await _dynamic_insert(
+                table="work_permit_docs",
+                shaped=shaped,
+                model_id=model_id,
+                source_filename=source_filename,
+                source_url=source_url,
+                content_type=content_type,
+                extra_json={"fields": shaped.get("fields", {})},
+            )
+        elif doc_type == "resume":
+            row_id = await _dynamic_insert(
+                table="resume_docs",
+                shaped=shaped,
+                model_id=model_id,
+                source_filename=source_filename,
+                source_url=source_url,
+                content_type=content_type,
+                extra_fixed={"doc_inferred_type": shaped.get("doc_type")},
+                extra_json={
+                    "fields": shaped.get("fields", {}),
+                    "key_value_pairs": shaped.get("key_value_pairs", []),
+                    "tables": shaped.get("tables", []),
+                },
+            )
         elif doc_type == "injury_report":
-            updates.update({
-                "di_model":            "prebuilt-document",
-                "injured_person_name": _get(di, "PersonName"),
-                "incident_date":       _parse_date(_get(di, "Date") or _get(di, "IncidentDate")),
-                "location":            _get(di, "Location"),
-                "injury_type":         _get(di, "InjuryType"),
-                "body_part":           _get(di, "BodyPart"),
-                "severity":            _get(di, "Severity"),
-                "notes":               _get(di, "Notes"),
-            })
+            row_id = await _dynamic_insert(
+                table="injury_report_docs_docs",
+                shaped=shaped,
+                model_id=model_id,
+                source_filename=source_filename,
+                source_url=source_url,
+                content_type=content_type,
+                extra_fixed={"doc_inferred_type": shaped.get("doc_type")},
+                extra_json={
+                    "fields": shaped.get("fields", {}),
+                    "key_value_pairs": shaped.get("key_value_pairs", []),
+                    "tables": shaped.get("tables", []),
+                },
+            )
+        else:
+            raise HTTPException(status_code=400, detail=f"Unsupported doc_type '{doc_type}'")
 
-        # ---------- dynamic UPDATE ----------
-        items = list(updates.items())
-        assignments, params = [], []
+        return {"doc_type": doc_type, "model_id": model_id, "row_id": row_id, "result": shaped}
 
-        JSON_COLS = {
-            "extracted_json","entities_json","skills","education","experience",
-            "certifications","transactions_json","line_items_json"
-        }
-
-        for col, val in items:
-            if col == "embedding":
-                if val is None:
-                    assignments.append("embedding = NULL")
-                else:
-                    assignments.append(f"{col} = ${len(params)+1}::vector")
-                    params.append(val)
-                continue
-
-            if col in JSON_COLS:
-                assignments.append(f"{col} = ${len(params)+1}::jsonb")
-                params.append(json.dumps(val, default=lambda o:
-                    float(o) if isinstance(o, Decimal)
-                    else o.isoformat() if isinstance(o, (datetime, date))
-                    else o
-                ) if val is not None else None)
-                continue
-
-            assignments.append(f"{col} = ${len(params)+1}")
-            params.append(val)
-
-        assignments.append("updated_at = NOW()")
-        where_idx = len(params) + 1
-        sql = f"UPDATE {TBL[doc_type]} SET " + ", ".join(assignments) + f" WHERE id = ${where_idx}"
-        params.append(id)
-
-        log.info("SQL template: %s | params=%d", sql, len(params))
-
-        conn = await get_conn()
-        try:
-            await conn.execute(sql, *params)
-        finally:
-            await conn.close()
-
-        return {"ok": True, "id": id, "chars": len(text or ""), "embedded": emb_literal is not None}
-
+    except ResourceNotFoundError as e:
+        raise HTTPException(
+            status_code=404,
+            detail=("Document Intelligence returned 404 (Resource not found). "
+                    f"Verify your endpoint/key and model availability for '{doc_type}'. "
+                    "Endpoint must be https://<name>.cognitiveservices.azure.com"),
+        ) from e
+    except HttpResponseError as e:
+        status = getattr(e, "status_code", None) or 502
+        message = getattr(e, "message", None) or "Service error from Document Intelligence."
+        raise HTTPException(status_code=status, detail=message) from e
+    except HTTPException:
+        raise
     except Exception as e:
-        log.exception("Extract failed: %s", e)
-        return error_response("Extraction failed", 500, "EEXTRACT", str(e))
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")

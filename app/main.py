@@ -1,32 +1,28 @@
-from fastapi import FastAPI, Request
-from app.routers import upload, extract, search
-from app.core.errors import catch_all_handler, error_response
-from app.core.logging import configure_logging
+# app/main.py
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
 
-configure_logging()
+from app.routers.extract import router as extract_router
+from app.db import init_db_pool, close_db_pool  # uses your asyncpg pool helpers
 
-app = FastAPI(title="ERP-AI Document Recognition", version="0.2.0")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    await init_db_pool()
+    yield
+    # Shutdown
+    await close_db_pool()
 
-# Global catch-all (last resort)
-app.add_exception_handler(Exception, catch_all_handler)
+app = FastAPI(
+    title="ERP-AI Document Intelligence API",
+    version="1.0",
+    lifespan=lifespan,
+)
 
-# Optional: lightweight middleware for request logging
-@app.middleware("http")
-async def log_requests(request: Request, call_next):
-    try:
-        response = await call_next(request)
-        return response
-    except Exception as exc:
-        # This will be handled by the global exception handler, but we log here too.
-        return await catch_all_handler(request, exc)
+# Routes
+app.include_router(extract_router)
 
+# Health
 @app.get("/health")
 async def health():
-    try:
-        return {"ok": True}
-    except Exception:
-        return error_response("Health check failed", 500, "EHEALTH")
-
-app.include_router(upload.router,  prefix="/v1")
-app.include_router(extract.router, prefix="/v1")
-app.include_router(search.router,  prefix="/v1")
+    return {"status": "ok"}
